@@ -11,14 +11,30 @@ import { convert as convertJsx } from './formats/jsx.mjs';
 import { convert as convertJson } from './formats/json.mjs';
 import { convert as convertSvg } from './formats/svg.mjs';
 import { convert as convertPng } from './formats/png.mjs';
+import { evaluateAssertion } from './assert.mjs';
 
 const RELAY_HOST = '127.0.0.1';
 const RELAY_PORT = 3055;
 const DEFAULT_CHANNEL = 'default';
 const BINDING_DIR = resolve(process.cwd(), '.figrig');
 const BINDING_FILE = join(BINDING_DIR, 'binding.json');
+const IMAGE_DIR = resolve(process.cwd(), '.figrig-run', 'images');
 const PATH_SEGMENTS = new Set(['file', 'design', 'proto', 'board', 'deck']);
 const READ_TIMEOUT_MS = 15000;
+
+// 写入操作枚举，与 plugin/main.js 的 WRITE_OPS 一致。
+const WRITE_OPS = [
+  'create-frame',
+  'create-rectangle',
+  'create-text',
+  'move',
+  'resize',
+  'delete',
+  'set-fill',
+  'set-layout',
+  'set-padding',
+  'set-item-spacing',
+];
 
 // 格式名 -> 转换器。
 const CONVERTERS = {
@@ -65,16 +81,28 @@ function parseArgs(argv) {
     if (token.startsWith('--')) {
       const body = token.slice(2);
       const eq = body.indexOf('=');
+      let key;
+      let value;
       if (eq >= 0) {
-        options[body.slice(0, eq)] = body.slice(eq + 1);
+        key = body.slice(0, eq);
+        value = body.slice(eq + 1);
       } else {
+        key = body;
         const next = argv[i + 1];
         if (next !== undefined && !next.startsWith('--')) {
-          options[body] = next;
+          value = next;
           i += 1;
         } else {
-          options[body] = 'true';
+          value = 'true';
         }
+      }
+      // 同名重复传入累积为数组（如多个 --expect）。
+      if (Object.prototype.hasOwnProperty.call(options, key)) {
+        const existing = options[key];
+        if (Array.isArray(existing)) existing.push(value);
+        else options[key] = [existing, value];
+      } else {
+        options[key] = value;
       }
     } else {
       positional.push(token);
@@ -140,12 +168,11 @@ function requestId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-// 向插件发 inspect，等待同 requestId 的 inspect-result 或 error。
-function requestInspect(options, nodeId, mode) {
+// 向插件发送 payload，等待同 requestId 的指定类型回包或 error。
+function requestRelay(options, payload, acceptType, label) {
   const channel = channelName(options.channel);
   const id = typeof options.id === 'string' && options.id.length > 0 ? options.id : 'cli';
-  const reqId = requestId();
-  const socket = openSocket(channel);
+  const socket = openSocket(channel, id);
 
   return new Promise((resolvePromise, rejectPromise) => {
     let settled = false;
@@ -164,12 +191,12 @@ function requestInspect(options, nodeId, mode) {
     }
 
     const timer = setTimeout(() => {
-      finish(new Error(`timeout waiting for inspect result (channel=${channel})`));
+      finish(new Error(`timeout waiting for ${label} result (channel=${channel})`));
     }, READ_TIMEOUT_MS);
 
     socket.on('open', () => {
       socket.send(JSON.stringify({ type: 'figrig-id', id }));
-      socket.send(JSON.stringify({ type: 'inspect', requestId: reqId, nodeId, mode }));
+      socket.send(JSON.stringify(payload));
     });
 
     socket.on('message', (data) => {
@@ -179,12 +206,12 @@ function requestInspect(options, nodeId, mode) {
       } catch {
         return;
       }
-      if (!parsed || parsed.requestId !== reqId) return;
+      if (!parsed || parsed.requestId !== payload.requestId) return;
       if (parsed.type === 'error') {
-        finish(new Error(parsed.message || 'inspect failed'));
+        finish(new Error(parsed.message || `${label} failed`));
         return;
       }
-      if (parsed.type === 'inspect-result') finish(null, parsed);
+      if (parsed.type === acceptType) finish(null, parsed);
     });
 
     socket.on('error', (error) => {
@@ -192,9 +219,41 @@ function requestInspect(options, nodeId, mode) {
     });
 
     socket.on('close', () => {
-      finish(new Error('connection closed before inspect result'));
+      finish(new Error(`connection closed before ${label} result`));
     });
   });
+}
+
+// 向插件发 inspect，等待 inspect-result。
+function requestInspect(options, nodeId, mode) {
+  return requestRelay(
+    options,
+    { type: 'inspect', requestId: requestId(), nodeId, mode },
+    'inspect-result',
+    'inspect',
+  );
+}
+
+// 向插件发 write，等待 write-result。
+function requestWrite(options, payload) {
+  return requestRelay(options, payload, 'write-result', 'write');
+}
+
+// 向插件发 preview，等待 preview-result。
+function requestPreview(options, nodeId) {
+  return requestRelay(
+    options,
+    { type: 'preview', requestId: requestId(), nodeId },
+    'preview-result',
+    'preview',
+  );
+}
+
+// 选项可能为单值或数组，统一为字符串数组。
+function normalizeList(value) {
+  if (value === undefined || value === null) return [];
+  if (Array.isArray(value)) return value.map((item) => String(item));
+  return [String(value)];
 }
 
 function commandConnect(options) {
@@ -278,12 +337,73 @@ async function commandExpand(options) {
   console.log(convertJson(result.node));
 }
 
+// 写入节点：经 relay 发 write，对回包节点或删除回执执行断言核验。
+async function commandWrite(options) {
+  const op = options.op;
+  if (typeof op !== 'string' || op.length === 0) {
+    fail(`usage: node cli.mjs write --op <${WRITE_OPS.join('|')}> [--parentId <id>] [--nodeId <id>] [--params <json>] [--expect <assertion>]...`);
+  }
+  if (!WRITE_OPS.includes(op)) {
+    fail(`invalid op: ${op}; allowed: ${WRITE_OPS.join(', ')}`);
+  }
+  let params = {};
+  if (typeof options.params === 'string') {
+    try {
+      params = JSON.parse(options.params);
+    } catch {
+      fail(`invalid params json: ${options.params}`);
+    }
+    if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+      fail('params must be a json object');
+    }
+  }
+  const expects = normalizeList(options.expect);
+  const payload = {
+    type: 'write',
+    requestId: requestId(),
+    op,
+    parentId: resolveNodeId(options.parentId),
+    nodeId: resolveNodeId(options.nodeId),
+    params,
+  };
+  const result = await requestWrite(options, payload);
+  // 删除回执以自身为断言目标，其余以回包节点为断言目标。
+  const target = result.deleted !== undefined ? result : result.node;
+  const failures = [];
+  let passed = 0;
+  for (const assertion of expects) {
+    const outcome = evaluateAssertion(target, assertion);
+    if (outcome.ok) passed += 1;
+    else failures.push({ assertion: outcome.assertion, reason: outcome.reason });
+  }
+  if (failures.length > 0) {
+    console.log(JSON.stringify({ status: 'failed', assertions: passed, failures }));
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ status: 'applied', assertions: passed }));
+}
+
+// 图片导出：经 preview 取 PNG 字节写入 .figrig-run/images，输出路径引用。
+async function commandReview(options) {
+  const nodeId = resolveNodeId(options.nodeId) || bindingNodeId();
+  if (!nodeId) fail('nodeId required: pass --nodeId or run bind first');
+  const result = await requestPreview(options, nodeId);
+  const bytes = Buffer.from(result.bytes);
+  mkdirSync(IMAGE_DIR, { recursive: true });
+  const normalized = nodeId.replace(/:/g, '_');
+  const path = join(IMAGE_DIR, `${normalized}-${Date.now()}.png`);
+  writeFileSync(path, bytes);
+  console.log(JSON.stringify({ status: 'exported', path }));
+}
+
 function usage() {
   console.log('usage: node cli.mjs <command> [args]');
   console.log('  connect [--channel <name>] [--id <name>] [--fileKey <key>]');
   console.log('  bind <figma-url>');
   console.log(`  read --intent <${INTENTS.join('|')}> [--nodeId <id>] [--channel <name>]`);
   console.log('  expand [--nodeId <id>] [--channel <name>]');
+  console.log(`  write --op <${WRITE_OPS.join('|')}> [--parentId <id>] [--nodeId <id>] [--params <json>] [--expect <assertion>]...`);
+  console.log('  review --nodeId <id> [--channel <name>]');
 }
 
 function main() {
@@ -308,6 +428,14 @@ function main() {
   }
   if (command === 'expand') {
     commandExpand(options).catch((error) => fail(error.message));
+    return;
+  }
+  if (command === 'write') {
+    commandWrite(options).catch((error) => fail(error.message));
+    return;
+  }
+  if (command === 'review') {
+    commandReview(options).catch((error) => fail(error.message));
     return;
   }
   fail(`unknown command: ${command}`);

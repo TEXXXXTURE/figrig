@@ -12,6 +12,8 @@ import { convert as toJsx } from '../formats/jsx.mjs';
 import { convert as toJson } from '../formats/json.mjs';
 import { convert as toSvg } from '../formats/svg.mjs';
 import { convert as toPng } from '../formats/png.mjs';
+import { resolvePath, evaluateAssertion } from '../assert.mjs';
+import { createStubFigma, loadPlugin as loadStubPlugin } from './stub-figma.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -286,6 +288,217 @@ async function main() {
   assert.ok(!/figma\.getNodeById\(/.test(source), '不得使用同步 getNodeById');
   assert.ok(!/figma\.root\.find/.test(source), '不得整文档同步遍历');
   console.log('assert: 使用 getNodeByIdAsync，未使用 getNodeById / root.findAll -> ok');
+
+  section('12. assert.mjs 路径解析与断言求值');
+  const assertNode = {
+    id: '1:1',
+    name: 'Card',
+    width: 400,
+    fills: [{ type: 'SOLID', hex: '#3366FF', color: { r: 0.2, g: 0.4, b: 1, a: 1 } }],
+    children: [
+      { id: '1:2', name: 'A', type: 'FRAME', children: [] },
+      { id: '1:3', name: 'B', type: 'TEXT', children: [] },
+    ],
+  };
+  assert.deepEqual(resolvePath(assertNode, 'fills[0].hex'), { found: true, value: '#3366FF' });
+  assert.deepEqual(resolvePath(assertNode, 'children.length'), { found: true, value: 2 });
+  assert.equal(resolvePath(assertNode, 'nope').found, false);
+  assert.equal(resolvePath(assertNode, 'fills[9].hex').found, false);
+  console.log(`resolvePath(fills[0].hex) -> ${resolvePath(assertNode, 'fills[0].hex').value}`);
+  console.log(`resolvePath(children.length) -> ${resolvePath(assertNode, 'children.length').value}`);
+
+  // 通过用例：数值、字符串、嵌套路径、容差。
+  const passCases = [
+    'exists',
+    'width=400',
+    'width=400.0000005',
+    'fills[0].hex=#3366FF',
+    'children.length=2',
+    'name=Card',
+    'children[1].id=1:3',
+  ];
+  for (const text of passCases) {
+    const outcome = evaluateAssertion(assertNode, text);
+    assert.equal(outcome.ok, true, `应通过: ${text} -> ${outcome.reason ?? ''}`);
+    console.log(`PASS ${text}`);
+  }
+
+  // 失败用例：路径不存在、值不等、类型不符、语法错误。
+  const failCases = [
+    ['x=1', /path not found/],
+    ['width=401', /value mismatch/],
+    ['width=abc', /type mismatch/],
+    ['children.length=3', /value mismatch/],
+    ['name=Card2', /value mismatch/],
+    ['bogus', /assertion must be/],
+  ];
+  for (const [text, pattern] of failCases) {
+    const outcome = evaluateAssertion(assertNode, text);
+    assert.equal(outcome.ok, false, `应失败: ${text}`);
+    assert.match(outcome.reason, pattern, `失败原因匹配: ${text}`);
+    console.log(`FAIL ${text} -> ${outcome.reason}`);
+  }
+  const missingTarget = evaluateAssertion(null, 'exists');
+  assert.equal(missingTarget.ok, false);
+  console.log(`FAIL exists(null) -> ${missingTarget.reason}`);
+
+  section('13. 插件 write 全部 op（桩 Figma 内存树）');
+  const harness = createStubFigma();
+  const rootFrame = harness.add(new harness.StubNode('FRAME', 'Root'));
+  const plugin2 = loadStubPlugin(harness.figma);
+
+  const frameRes = await plugin2.send({
+    type: 'write', requestId: 'w1', op: 'create-frame',
+    parentId: rootFrame.id, params: { name: 'Panel', width: 320, height: 200, x: 16, y: 24 },
+  });
+  assert.equal(frameRes.type, 'write-result');
+  assert.equal(frameRes.op, 'create-frame');
+  const frameNode = frameRes.node;
+  assert.equal(frameNode.name, 'Panel');
+  assert.equal(frameNode.width, 320);
+  assert.equal(frameNode.height, 200);
+  assert.equal(frameNode.x, 16);
+  assert.equal(frameNode.y, 24);
+  assert.ok(rootFrame.children.some((child) => child.id === frameNode.id), '创建的 Frame 在父节点 children 中');
+  console.log('create-frame ->', JSON.stringify({ id: frameNode.id, name: frameNode.name, width: frameNode.width, height: frameNode.height }));
+
+  const rectRes = await plugin2.send({
+    type: 'write', requestId: 'w2', op: 'create-rectangle',
+    parentId: frameNode.id, params: { name: 'Box', width: 200, height: 120 },
+  });
+  const rectNode = rectRes.node;
+  assert.equal(rectRes.type, 'write-result');
+  assert.equal(rectNode.type, 'RECTANGLE');
+  assert.equal(rectNode.width, 200);
+  assert.equal(rectNode.height, 120);
+  const frameInstance = harness.registry.get(frameNode.id);
+  assert.ok(frameInstance.children.some((child) => child.id === rectNode.id), '创建的 Rectangle 在父节点 children 中');
+  console.log('create-rectangle ->', JSON.stringify({ id: rectNode.id, type: rectNode.type, width: rectNode.width, height: rectNode.height }));
+
+  const textRes = await plugin2.send({
+    type: 'write', requestId: 'w3', op: 'create-text',
+    parentId: frameNode.id, params: { characters: 'Hello FigRig', width: 180, height: 24 },
+  });
+  const textNode = textRes.node;
+  assert.equal(textRes.type, 'write-result');
+  assert.equal(textNode.type, 'TEXT');
+  assert.equal(textNode.characters, 'Hello FigRig');
+  assert.ok(frameInstance.children.some((child) => child.id === textNode.id), '创建的 Text 在父节点 children 中');
+  console.log('create-text ->', JSON.stringify({ id: textNode.id, type: textNode.type, characters: textNode.characters }));
+
+  const moved = await plugin2.send({
+    type: 'write', requestId: 'w4', op: 'move', nodeId: rectNode.id, params: { x: 48, y: 64 },
+  });
+  assert.equal(moved.node.x, 48);
+  assert.equal(moved.node.y, 64);
+  console.log('move ->', JSON.stringify({ x: moved.node.x, y: moved.node.y }));
+
+  const resized = await plugin2.send({
+    type: 'write', requestId: 'w5', op: 'resize', nodeId: rectNode.id, params: { width: 400, height: 300 },
+  });
+  assert.equal(resized.node.width, 400);
+  assert.equal(resized.node.height, 300);
+  assert.equal(harness.registry.get(rectNode.id).width, 400, 'resize 后 width 读回一致');
+  console.log('resize ->', JSON.stringify({ width: resized.node.width, height: resized.node.height }));
+
+  const filled = await plugin2.send({
+    type: 'write', requestId: 'w6', op: 'set-fill', nodeId: rectNode.id, params: { hex: '#3366FF' },
+  });
+  assert.equal(filled.node.fills[0].hex, '#3366FF');
+  assert.equal(harness.registry.get(rectNode.id).fills[0].type, 'SOLID');
+  assert.ok(Math.abs(harness.registry.get(rectNode.id).fills[0].color.r - 0x33 / 255) < 1e-6, 'set-fill 后色值一致');
+  console.log('set-fill hex ->', JSON.stringify(filled.node.fills));
+
+  const filled2 = await plugin2.send({
+    type: 'write', requestId: 'w7', op: 'set-fill', nodeId: rectNode.id, params: { r: 0.1, g: 0.2, b: 0.3, a: 0.5 },
+  });
+  const rawFills = harness.registry.get(rectNode.id).fills;
+  assert.equal(rawFills[0].type, 'SOLID');
+  assert.ok(Math.abs(rawFills[0].color.r - 0.1) < 1e-6);
+  assert.ok(Math.abs(rawFills[0].color.g - 0.2) < 1e-6);
+  assert.ok(Math.abs(rawFills[0].color.b - 0.3) < 1e-6);
+  assert.ok(Math.abs(rawFills[0].color.a - 0.5) < 1e-6);
+  assert.equal(filled2.node.fills[0].rgba, 'rgba(26, 51, 77, 0.5)');
+  console.log('set-fill rgba ->', JSON.stringify(rawFills));
+
+  const layout = await plugin2.send({
+    type: 'write', requestId: 'w8', op: 'set-layout', nodeId: frameNode.id, params: { layoutMode: 'VERTICAL' },
+  });
+  const rawFrame = harness.registry.get(frameNode.id);
+  assert.equal(layout.node.layoutMode, 'VERTICAL');
+  assert.equal(rawFrame.primaryAxisSizingMode, 'AUTO');
+  assert.equal(rawFrame.counterAxisSizingMode, 'AUTO');
+  console.log('set-layout ->', JSON.stringify({ layoutMode: layout.node.layoutMode, primaryAxisSizingMode: rawFrame.primaryAxisSizingMode, counterAxisSizingMode: rawFrame.counterAxisSizingMode }));
+
+  const padded = await plugin2.send({
+    type: 'write', requestId: 'w9', op: 'set-padding', nodeId: frameNode.id,
+    params: { paddingLeft: 12, paddingRight: 12, paddingTop: 8, paddingBottom: 8 },
+  });
+  assert.equal(padded.node.paddingLeft, 12);
+  assert.equal(padded.node.paddingRight, 12);
+  assert.equal(padded.node.paddingTop, 8);
+  assert.equal(padded.node.paddingBottom, 8);
+  console.log('set-padding ->', JSON.stringify({ paddingLeft: padded.node.paddingLeft, paddingTop: padded.node.paddingTop, paddingBottom: padded.node.paddingBottom }));
+
+  const spacing = await plugin2.send({
+    type: 'write', requestId: 'w10', op: 'set-item-spacing', nodeId: frameNode.id, params: { itemSpacing: 7 },
+  });
+  assert.equal(spacing.node.itemSpacing, 7);
+  assert.equal(spacing.node.children.length, 2, 'children 数组长度随写入读回');
+  console.log('set-item-spacing ->', JSON.stringify({ itemSpacing: spacing.node.itemSpacing, children: spacing.node.children.length }));
+
+  const deleted = await plugin2.send({
+    type: 'write', requestId: 'w11', op: 'delete', nodeId: rectNode.id,
+  });
+  assert.equal(deleted.type, 'write-result');
+  assert.equal(deleted.deleted, true);
+  assert.equal(deleted.nodeId, rectNode.id);
+  assert.equal(harness.registry.has(rectNode.id), false, 'delete 后节点不存在');
+  assert.equal(await harness.figma.getNodeByIdAsync(rectNode.id), null);
+  assert.ok(!frameInstance.children.some((child) => child.id === rectNode.id), 'delete 后从父节点 children 移除');
+  console.log('delete ->', JSON.stringify({ deleted: deleted.deleted, nodeId: deleted.nodeId, remaining: frameInstance.children.length }));
+
+  section('14. 插件 preview（exportAsync 返回固定 8 字节）');
+  const preview = await plugin2.send({ type: 'preview', requestId: 'p1', nodeId: textNode.id });
+  assert.equal(preview.type, 'preview-result');
+  assert.equal(preview.nodeId, textNode.id);
+  assert.ok(Array.isArray(preview.bytes));
+  assert.equal(preview.bytes.length, 8);
+  assert.deepEqual(Array.from(preview.bytes.slice(0, 4)), [0x89, 0x50, 0x4e, 0x47]);
+  console.log('preview ->', JSON.stringify({ nodeId: preview.nodeId, bytes: preview.bytes.length, head: preview.bytes.slice(0, 4) }));
+
+  section('15. write / preview 错误分支');
+  const errorCases = [
+    [{ op: 'create-circle', parentId: rootFrame.id, params: {} }, /invalid op/],
+    [{ op: 'create-frame', params: {} }, /parentId required/],
+    [{ op: 'create-frame', parentId: '9:9', params: {} }, /parent not found/],
+    [{ op: 'resize', params: { width: 10 } }, /nodeId required/],
+    [{ op: 'move', nodeId: '9:9', params: { x: 1 } }, /node not found/],
+    [{ op: 'set-fill', nodeId: textNode.id, params: {} }, /hex or r\/g\/b/],
+    [{ op: 'set-fill', nodeId: textNode.id, params: { hex: 'zzz' } }, /invalid hex/],
+    [{ op: 'set-layout', nodeId: frameNode.id, params: { layoutMode: 'DIAGONAL' } }, /layoutMode/],
+    [{ op: 'resize', nodeId: textNode.id, params: {} }, /width or height/],
+    [{ op: 'set-item-spacing', nodeId: frameNode.id, params: {} }, /itemSpacing/],
+  ];
+  for (const [fields, pattern] of errorCases) {
+    const outcome = await plugin2.send({ type: 'write', requestId: 'err', ...fields });
+    assert.equal(outcome.type, 'error');
+    assert.match(outcome.message, pattern);
+    console.log(`write ${fields.op} -> error: ${outcome.message}`);
+  }
+  const badPreview = await plugin2.send({ type: 'preview', requestId: 'e-preview', nodeId: '9:9' });
+  assert.equal(badPreview.type, 'error');
+  assert.match(badPreview.message, /node not found/);
+  console.log(`preview -> error: ${badPreview.message}`);
+
+  section('16. 保留命令（write/preview 扩展后）');
+  const pong2 = await plugin2.send({ type: 'ping', requestId: 'r-ping2' });
+  assert.equal(pong2.type, 'pong');
+  const hs2 = await plugin2.send({ type: 'handshake', requestId: 'r-hs2' });
+  assert.equal(hs2.type, 'handshake-ack');
+  const unknown2 = await plugin2.send({ type: 'nope', requestId: 'r-unknown2' });
+  assert.equal(unknown2.type, 'error');
+  console.log('assert: ping/handshake 保留，未知命令 -> error ok');
 
   console.log('\nALL CHECKS PASSED');
 }
