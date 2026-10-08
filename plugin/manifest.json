@@ -1,0 +1,19 @@
+{
+  "name": "FigRig",
+  "id": "figrig-local-bridge",
+  "api": "1.0",
+  "main": "main.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": [
+      "http://localhost:3055",
+      "ws://localhost:3055"
+    ],
+    "devAllowedDomains": [
+      "http://localhost:3055",
+      "ws://localhost:3055"
+    ]
+  }
+}

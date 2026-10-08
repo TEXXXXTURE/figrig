@@ -24,6 +24,24 @@ AI Agent → figrig CLI → localhost WebSocket → Figma 插件 → Plugin API
 
 开发中（Windows 优先，Node.js 20+）。详见实施计划。
 
+## 安装
+
+```bash
+npm install
+npm start        # 启动 relay，监听 ws://127.0.0.1:3055
+```
+
+## 第 1 步链路
+
+```bash
+node cli.mjs bind "https://www.figma.com/design/<fileKey>/<名称>?node-id=1-2"
+node cli.mjs connect --channel demo --fileKey <fileKey>
+```
+
+- `bind` 解析 fileKey 与 node-id（`1-2` 归一为 `1:2`），写入 `.figrig/binding.json`
+- `connect` 以 channel 成员身份挂起；后续命令携带的 fileKey 与绑定值不一致时报错
+- 插件：Figma 中导入 `plugin/manifest.json`，运行后在 UI 填入同一 channel 并连接
+
 ## 许可证
 
 Apache-2.0

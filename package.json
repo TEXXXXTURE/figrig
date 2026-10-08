@@ -1,0 +1,22 @@
+{
+  "name": "figrig",
+  "version": "0.1.0",
+  "description": "本地链路：AI Agent 经 CLI 读写 Figma 文件、制作可交互原型。",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TEXXXXTURE/figrig.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node relay.mjs",
+    "relay": "node relay.mjs",
+    "check": "node --check relay.mjs && node --check cli.mjs && node --check plugin/main.js"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}

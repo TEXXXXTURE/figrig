@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>FigRig</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 12px; margin: 0; padding: 10px; }
+  .row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+  input { flex: 1; padding: 4px; }
+  button { padding: 4px 10px; }
+  #status { margin-bottom: 8px; }
+  #log { height: 180px; overflow: auto; border: 1px solid #ccc; padding: 6px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+  <div class="row">
+    <input id="channel" value="default" />
+    <button id="connect">connect</button>
+    <button id="disconnect">disconnect</button>
+  </div>
+  <div id="status">status: idle</div>
+  <div id="log"></div>
+<script>
+  const RELAY_URL = 'ws://localhost:3055';
+  const channelInput = document.getElementById('channel');
+  const statusBox = document.getElementById('status');
+  const logBox = document.getElementById('log');
+  let socket = null;
+
+  function log(line) {
+    logBox.textContent += line + '\n';
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  function setStatus(value) {
+    statusBox.textContent = 'status: ' + value;
+  }
+
+  function channelName() {
+    const value = channelInput.value.trim();
+    return value.length > 0 ? value : 'default';
+  }
+
+  function sendToMain(message) {
+    parent.postMessage({ pluginMessage: message }, '*');
+  }
+
+  function connect() {
+    if (socket) return;
+    const channel = channelName();
+    setStatus('connecting ' + channel);
+    socket = new WebSocket(RELAY_URL + '?channel=' + encodeURIComponent(channel));
+
+    socket.onopen = () => {
+      setStatus('connected ' + channel);
+      log('open channel=' + channel);
+      sendToMain({ type: 'handshake' });
+    };
+
+    socket.onmessage = (event) => {
+      log('in ' + event.data);
+      let message = null;
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        message = { type: 'raw', text: String(event.data) };
+      }
+      sendToMain(message);
+    };
+
+    socket.onclose = () => {
+      setStatus('closed');
+      log('close channel=' + channel);
+      socket = null;
+    };
+
+    socket.onerror = () => {
+      setStatus('error');
+      log('error ' + channel);
+    };
+  }
+
+  function disconnect() {
+    if (!socket) return;
+    socket.close();
+  }
+
+  document.getElementById('connect').addEventListener('click', connect);
+  document.getElementById('disconnect').addEventListener('click', disconnect);
+
+  // 主线程回包：转发至 relay。
+  window.onmessage = (event) => {
+    const message = event.data.pluginMessage;
+    if (!message) return;
+    const text = JSON.stringify(message);
+    log('out ' + text);
+    if (socket && socket.readyState === WebSocket.OPEN) socket.send(text);
+  };
+</script>
+</body>
+</html>
