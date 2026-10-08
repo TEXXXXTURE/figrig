@@ -42,6 +42,19 @@ node cli.mjs connect --channel demo --fileKey <fileKey>
 - `connect` 以 channel 成员身份挂起；后续命令携带的 fileKey 与绑定值不一致时报错
 - 插件：Figma 中导入 `plugin/manifest.json`，运行后在 UI 填入同一 channel 并连接
 
+## 第 2 步：结构读取与意图路由
+
+```bash
+node cli.mjs read --intent inspect --nodeId 1:2    # 精简 JSX 概览，读取深度 overview
+node cli.mjs read --intent edit-style --nodeId 1:2 # 原始值 JSON，读取深度 full
+node cli.mjs read --intent review --nodeId 1:2     # review -> PNG，本步返回 pending 占位
+node cli.mjs expand --nodeId 1:2                   # 指定子树完整属性（渐进披露）
+npm run verify                                     # 桩节点校验：路由、转换器、节点上限、字段范围
+npm run check                                       # 全部 js/mjs 语法检查
+```
+
+意图到格式的映射固定：`inspect→jsx`、`create`/`edit-layout`/`edit-style`/`prototype→json`、`vector→svg`、`review→png`。非法意图直接报错，不推断。默认上下文只含结构概览，PNG/SVG 不进入默认输出。
+
 ## 许可证
 
 Apache-2.0
