@@ -1,4 +1,4 @@
-# FigRig · 画布操纵台
+# FigRig
 
 让 AI Agent 通过本地 CLI 读写 Figma 画布、制作可交互原型。无需 Figma 付费订阅，免费版即可。
 
