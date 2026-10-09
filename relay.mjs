@@ -3,7 +3,7 @@
 import { WebSocketServer } from 'ws';
 
 const HOST = '127.0.0.1';
-const PORT = 3055;
+const PORT = Number(process.env.FIGRIG_RELAY_PORT) || 3055;
 const DEFAULT_CHANNEL = 'default';
 
 // channel -> Set<WebSocket>

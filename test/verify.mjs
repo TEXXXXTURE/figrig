@@ -1,7 +1,7 @@
 // 校验脚本：意图路由、格式转换器、节点计数上限、渐进披露字段范围。
 // 桩节点驱动；插件在 Figma 沙箱内的真机行为属外部验证项，此处以 vm 加载 plugin/main.js 校验其逻辑。
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createContext, runInContext } from 'node:vm';
@@ -14,6 +14,9 @@ import { convert as toSvg } from '../formats/svg.mjs';
 import { convert as toPng } from '../formats/png.mjs';
 import { resolvePath, evaluateAssertion } from '../assert.mjs';
 import { createStubFigma, loadPlugin as loadStubPlugin } from './stub-figma.mjs';
+import { uuidv4, planOperation, createTask, setTaskStatus } from '../task-store.mjs';
+import { resolveUnresolved } from '../recover.mjs';
+import { buildTemplate, addComponent, getComponent, readComponents, writeComponents, replayTemplate } from '../registry.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -499,6 +502,181 @@ async function main() {
   const unknown2 = await plugin2.send({ type: 'nope', requestId: 'r-unknown2' });
   assert.equal(unknown2.type, 'error');
   console.log('assert: ping/handshake 保留，未知命令 -> error ok');
+
+  section('17. 幂等：重投 reused、内容不一致报错、running 拒绝写入');
+  rmSync(resolve(ROOT, '.figrig-run', 'tasks'), { recursive: true, force: true });
+  const idDesc = {
+    requestId: uuidv4(), operation: 'create-frame', nodeId: '1:2',
+    params: { name: 'Panel', width: 100, height: 50 }, expect: ['name=Panel'],
+  };
+  createTask(idDesc);
+  setTaskStatus(idDesc.requestId, 'running');
+  setTaskStatus(idDesc.requestId, 'done', { output: { status: 'applied', op: 'create-frame', nodeId: '1:9', assertions: 1 } });
+  const reused = planOperation(idDesc);
+  assert.equal(reused.action, 'reused');
+  assert.equal(reused.task.output.nodeId, '1:9');
+  console.log(`planOperation(重投同 requestId) -> ${reused.action}: output.nodeId=${reused.task.output.nodeId}`);
+
+  const conflictParams = planOperation({ ...idDesc, params: { name: 'Other', width: 100, height: 50 } });
+  assert.equal(conflictParams.action, 'conflict');
+  assert.match(conflictParams.reasons.join(' '), /params differ/);
+  console.log(`planOperation(参数变更) -> ${conflictParams.action}: ${conflictParams.reasons.join('; ')}`);
+
+  const conflictTarget = planOperation({ ...idDesc, nodeId: '1:3' });
+  assert.equal(conflictTarget.action, 'conflict');
+  assert.match(conflictTarget.reasons.join(' '), /nodeId/);
+  console.log(`planOperation(目标变更) -> ${conflictTarget.action}: ${conflictTarget.reasons.join('; ')}`);
+
+  const runningDesc = { requestId: uuidv4(), operation: 'move', nodeId: '1:5', params: { x: 1, y: 1 }, expect: [] };
+  createTask(runningDesc);
+  setTaskStatus(runningDesc.requestId, 'running');
+  const blocked = planOperation(
+    { requestId: uuidv4(), operation: 'resize', nodeId: '1:6', params: { width: 5 }, expect: [] },
+    { mutation: true },
+  );
+  assert.equal(blocked.action, 'blocked');
+  assert.match(blocked.reason, /incomplete/);
+  console.log(`planOperation(running 存在时新写) -> ${blocked.action}: ${blocked.reason}`);
+  setTaskStatus(runningDesc.requestId, 'done');
+
+  section('18. requestId UUID v4 格式');
+  const sample = uuidv4();
+  assert.match(sample, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  console.log(`uuidv4() -> ${sample}`);
+
+  section('19. 故障恢复：resolveUnresolved 三态');
+  rmSync(resolve(ROOT, '.figrig-run', 'tasks'), { recursive: true, force: true });
+
+  const presentTask = {
+    requestId: uuidv4(), operation: 'create-frame', nodeId: '1:2',
+    params: { name: 'Box', width: 10, height: 10 }, expect: [],
+  };
+  createTask(presentTask);
+  setTaskStatus(presentTask.requestId, 'unresolved', { reason: 'relay timeout' });
+  const presentReport = await resolveUnresolved({ requestId: presentTask.requestId }, {
+    inspect: async () => ({
+      found: true,
+      node: {
+        id: '1:2', name: 'Parent', type: 'FRAME',
+        children: [{ id: '1:9', name: 'Box', type: 'FRAME', width: 10, height: 10, children: [] }],
+      },
+    }),
+  });
+  assert.equal(presentReport.outcomes[0].resolution, 'verified-present');
+  assert.equal(presentReport.outcomes[0].status, 'done');
+  console.log(`recover present -> ${presentReport.outcomes[0].status}/${presentReport.outcomes[0].resolution}`);
+
+  const absentTask = {
+    requestId: uuidv4(), operation: 'create-frame', nodeId: '1:2',
+    params: { name: 'Gone', width: 10, height: 10 }, expect: [],
+  };
+  createTask(absentTask);
+  setTaskStatus(absentTask.requestId, 'unresolved', { reason: 'relay timeout' });
+  const absentReport = await resolveUnresolved({ requestId: absentTask.requestId }, {
+    inspect: async () => ({ found: true, node: { id: '1:2', name: 'Parent', type: 'FRAME', children: [] } }),
+  });
+  assert.equal(absentReport.outcomes[0].resolution, 'verified-absent');
+  assert.equal(absentReport.outcomes[0].status, 'redoable');
+  console.log(`recover absent(无匹配子节点) -> ${absentReport.outcomes[0].status}/${absentReport.outcomes[0].resolution}`);
+
+  const missingTask = {
+    requestId: uuidv4(), operation: 'resize', nodeId: '1:7',
+    params: { width: 20 }, expect: [],
+  };
+  createTask(missingTask);
+  setTaskStatus(missingTask.requestId, 'unresolved', { reason: 'relay timeout' });
+  const missingReport = await resolveUnresolved({ requestId: missingTask.requestId }, {
+    inspect: async () => ({ found: false }),
+  });
+  assert.equal(missingReport.outcomes[0].resolution, 'verified-absent');
+  assert.equal(missingReport.outcomes[0].status, 'redoable');
+  console.log(`recover absent(目标缺失) -> ${missingReport.outcomes[0].status}/${missingReport.outcomes[0].resolution}`);
+
+  const mismatchTask = {
+    requestId: uuidv4(), operation: 'move', nodeId: '1:5',
+    params: { x: 5, y: 5 }, expect: [],
+  };
+  createTask(mismatchTask);
+  setTaskStatus(mismatchTask.requestId, 'unresolved', { reason: 'relay timeout' });
+  const mismatchReport = await resolveUnresolved({ requestId: mismatchTask.requestId }, {
+    inspect: async () => ({ found: true, node: { id: '1:5', name: 'N', type: 'FRAME', x: 99, y: 99, children: [] } }),
+  });
+  assert.equal(mismatchReport.outcomes[0].resolution, 'unresolved');
+  assert.equal(mismatchReport.outcomes[0].status, 'unresolved');
+  assert.match(mismatchReport.outcomes[0].reason, /attribute mismatch/);
+  console.log(`recover unresolved(属性不符) -> ${mismatchReport.outcomes[0].status}/${mismatchReport.outcomes[0].resolution}: ${mismatchReport.outcomes[0].reason}`);
+
+  section('20. 组件注册表：增查');
+  const regName = `Card-${Date.now().toString(36)}`;
+  const registrySnapshot = readComponents();
+  const record = addComponent({
+    name: regName, nodeId: '1:1', source: 'local',
+    template: [{ op: 'create-frame', ref: -1, params: { name: 'Card' } }],
+  });
+  assert.equal(getComponent(regName).name, regName);
+  assert.equal(getComponent(regName).source, 'local');
+  assert.ok(readComponents().some((entry) => entry.name === regName));
+  console.log(`addComponent(${regName}) -> nodeId=${record.nodeId} steps=${record.template.length}`);
+  console.log(`getComponent(${regName}).name -> ${getComponent(regName).name}`);
+  let duplicate = null;
+  try {
+    addComponent({ name: regName, nodeId: '1:1', source: 'local', template: [] });
+  } catch (error) {
+    duplicate = error;
+  }
+  assert.ok(duplicate && /already registered/.test(duplicate.message));
+  console.log(`addComponent(重复名) -> throws: ${duplicate.message}`);
+  writeComponents(registrySnapshot);
+
+  section('21. 模板复放：buildTemplate + replayTemplate（桩插件）');
+  const harness3 = createStubFigma();
+  const sourceFrame = harness3.add(new harness3.StubNode('FRAME', 'Card'));
+  sourceFrame.width = 200;
+  sourceFrame.height = 120;
+  sourceFrame.layoutMode = 'VERTICAL';
+  sourceFrame.itemSpacing = 6;
+  sourceFrame.paddingLeft = 8;
+  sourceFrame.paddingRight = 8;
+  sourceFrame.paddingTop = 8;
+  sourceFrame.paddingBottom = 8;
+  sourceFrame.fills = [{ type: 'SOLID', hex: '#112233', rgba: 'rgba(17, 34, 51, 1)', color: { r: 17 / 255, g: 34 / 255, b: 51 / 255, a: 1 } }];
+  const sourceTitle = harness3.add(new harness3.StubNode('TEXT', 'Title'));
+  sourceTitle.characters = 'Hi';
+  sourceTitle.width = 80;
+  sourceTitle.height = 20;
+  sourceTitle.fontSize = 14;
+  sourceFrame.appendChild(sourceTitle);
+
+  const plugin3 = loadStubPlugin(harness3.figma);
+  const fullSource = await plugin3.send({ type: 'inspect', requestId: 'src-full', nodeId: sourceFrame.id, mode: 'full' });
+  const template = buildTemplate(fullSource.node);
+  assert.equal(template[0].op, 'create-frame');
+  assert.equal(template[0].ref, -1);
+  assert.ok(template.some((step) => step.op === 'set-layout'));
+  assert.ok(template.some((step) => step.op === 'set-padding'));
+  assert.ok(template.some((step) => step.op === 'set-fill'));
+  assert.ok(template.some((step) => step.op === 'create-text'));
+  console.log(`buildTemplate -> ${template.map((step) => step.op).join(' > ')}`);
+
+  const targetFrame = harness3.add(new harness3.StubNode('FRAME', 'Target'));
+  const replaySteps = await replayTemplate(template, targetFrame.id, (payload) => plugin3.send({
+    type: 'write', requestId: uuidv4(), op: payload.op, parentId: payload.parentId, nodeId: payload.nodeId, params: payload.params,
+  }));
+  assert.equal(replaySteps.length, template.length);
+  const targetInstance = harness3.registry.get(targetFrame.id);
+  assert.equal(targetInstance.children.length, 1);
+  const created = targetInstance.children[0];
+  assert.equal(created.name, 'Card');
+  assert.equal(created.layoutMode, 'VERTICAL');
+  assert.equal(created.itemSpacing, 6);
+  assert.equal(created.width, 200);
+  assert.equal(created.paddingLeft, 8);
+  assert.equal(created.fills[0].type, 'SOLID');
+  assert.ok(Math.abs(created.fills[0].color.r - 0x11 / 255) < 1e-6, 'set-fill 后色值一致');
+  assert.equal(created.children.length, 1);
+  assert.equal(created.children[0].name, 'Title');
+  assert.equal(created.children[0].characters, 'Hi');
+  console.log(`replayTemplate ${replaySteps.length} 步 -> Card(name=${created.name}, layout=${created.layoutMode}, fill=${created.fills[0].type}, children=${created.children.length}) ok`);
 
   console.log('\nALL CHECKS PASSED');
 }

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // cli：命令行入口。命令 connect（作为 channel 成员挂起）、bind（解析 Figma 链接并写入绑定）、
-// read（按意图路由格式并读取节点）、expand（读取指定节点完整属性）。
+// read（按意图路由格式并读取节点）、expand（读取指定节点完整属性）、write（写入并断言）、
+// review（导出 PNG）、recover（故障恢复）、component-add / component-list / component-use（组件注册表）。
+// 经 relay 的请求携带 UUID v4 格式 requestId，并记入任务记录以支持幂等与故障恢复。
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -12,29 +14,20 @@ import { convert as convertJson } from './formats/json.mjs';
 import { convert as convertSvg } from './formats/svg.mjs';
 import { convert as convertPng } from './formats/png.mjs';
 import { evaluateAssertion } from './assert.mjs';
+import { WRITE_OPS, CREATE_SET } from './ops.mjs';
+import { createTask, planOperation, setTaskStatus, uuidv4 } from './task-store.mjs';
+import { resolveUnresolved } from './recover.mjs';
+import { addComponent, buildTemplate, getComponent, readComponents, registryPath, replayTemplate } from './registry.mjs';
 
 const RELAY_HOST = '127.0.0.1';
-const RELAY_PORT = 3055;
+const RELAY_PORT = Number(process.env.FIGRIG_RELAY_PORT) || 3055;
 const DEFAULT_CHANNEL = 'default';
 const BINDING_DIR = resolve(process.cwd(), '.figrig');
 const BINDING_FILE = join(BINDING_DIR, 'binding.json');
 const IMAGE_DIR = resolve(process.cwd(), '.figrig-run', 'images');
 const PATH_SEGMENTS = new Set(['file', 'design', 'proto', 'board', 'deck']);
-const READ_TIMEOUT_MS = 15000;
-
-// 写入操作枚举，与 plugin/main.js 的 WRITE_OPS 一致。
-const WRITE_OPS = [
-  'create-frame',
-  'create-rectangle',
-  'create-text',
-  'move',
-  'resize',
-  'delete',
-  'set-fill',
-  'set-layout',
-  'set-padding',
-  'set-item-spacing',
-];
+const READ_TIMEOUT_MS = Number(process.env.FIGRIG_TIMEOUT_MS) || 15000;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // 格式名 -> 转换器。
 const CONVERTERS = {
@@ -132,6 +125,16 @@ function bindingNodeId() {
   return binding && binding.nodeId ? binding.nodeId : null;
 }
 
+// requestId：命令行提供时校验 UUID v4 格式，未提供时生成。
+function requestIdFrom(options) {
+  const raw = options.requestId;
+  if (raw === undefined) return uuidv4();
+  if (typeof raw !== 'string' || !UUID_V4.test(raw)) {
+    fail(`invalid requestId (uuid v4 required): ${String(raw)}`);
+  }
+  return raw;
+}
+
 function parseFigmaUrl(url) {
   let parsed;
   try {
@@ -159,20 +162,23 @@ function channelName(raw) {
   return raw.trim() || DEFAULT_CHANNEL;
 }
 
-function openSocket(channel, id) {
-  const socket = new WebSocket(`ws://${RELAY_HOST}:${RELAY_PORT}?channel=${encodeURIComponent(channel)}`);
-  return socket;
+function openSocket(channel) {
+  return new WebSocket(`ws://${RELAY_HOST}:${RELAY_PORT}?channel=${encodeURIComponent(channel)}`);
 }
 
-function requestId() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+function transportError(message) {
+  const error = new Error(message);
+  error.transport = true;
+  return error;
 }
 
 // 向插件发送 payload，等待同 requestId 的指定类型回包或 error。
+// 超时、连接关闭、socket 错误标记 transport；插件侧 error 标记 plugin。
 function requestRelay(options, payload, acceptType, label) {
   const channel = channelName(options.channel);
   const id = typeof options.id === 'string' && options.id.length > 0 ? options.id : 'cli';
-  const socket = openSocket(channel, id);
+  const socket = openSocket(channel);
+  const recoverHint = `; run: node cli.mjs recover --requestId ${payload.requestId}`;
 
   return new Promise((resolvePromise, rejectPromise) => {
     let settled = false;
@@ -191,7 +197,7 @@ function requestRelay(options, payload, acceptType, label) {
     }
 
     const timer = setTimeout(() => {
-      finish(new Error(`timeout waiting for ${label} result (channel=${channel})`));
+      finish(transportError(`timeout waiting for ${label} result (channel=${channel})${recoverHint}`));
     }, READ_TIMEOUT_MS);
 
     socket.on('open', () => {
@@ -208,30 +214,27 @@ function requestRelay(options, payload, acceptType, label) {
       }
       if (!parsed || parsed.requestId !== payload.requestId) return;
       if (parsed.type === 'error') {
-        finish(new Error(parsed.message || `${label} failed`));
+        const error = new Error(parsed.message || `${label} failed`);
+        error.plugin = true;
+        finish(error);
         return;
       }
       if (parsed.type === acceptType) finish(null, parsed);
     });
 
     socket.on('error', (error) => {
-      finish(new Error(`socket error: ${error.message}`));
+      finish(transportError(`socket error: ${error.message}${recoverHint}`));
     });
 
     socket.on('close', () => {
-      finish(new Error(`connection closed before ${label} result`));
+      finish(transportError(`connection closed before ${label} result${recoverHint}`));
     });
   });
 }
 
 // 向插件发 inspect，等待 inspect-result。
-function requestInspect(options, nodeId, mode) {
-  return requestRelay(
-    options,
-    { type: 'inspect', requestId: requestId(), nodeId, mode },
-    'inspect-result',
-    'inspect',
-  );
+function requestInspect(options, nodeId, mode, requestId) {
+  return requestRelay(options, { type: 'inspect', requestId, nodeId, mode }, 'inspect-result', 'inspect');
 }
 
 // 向插件发 write，等待 write-result。
@@ -240,13 +243,8 @@ function requestWrite(options, payload) {
 }
 
 // 向插件发 preview，等待 preview-result。
-function requestPreview(options, nodeId) {
-  return requestRelay(
-    options,
-    { type: 'preview', requestId: requestId(), nodeId },
-    'preview-result',
-    'preview',
-  );
+function requestPreview(options, nodeId, requestId) {
+  return requestRelay(options, { type: 'preview', requestId, nodeId }, 'preview-result', 'preview');
 }
 
 // 选项可能为单值或数组，统一为字符串数组。
@@ -256,6 +254,38 @@ function normalizeList(value) {
   return [String(value)];
 }
 
+// 幂等包裹：判定重投、记录任务状态。execute 返回命令输出对象；transport 错误标记 unresolved。
+async function withIdempotency(descriptor, { mutation }, execute) {
+  const plan = planOperation(descriptor, { mutation });
+  if (plan.action === 'conflict') {
+    fail(`requestId ${descriptor.requestId} conflict: ${plan.reasons.join('; ')}`);
+  }
+  if (plan.action === 'blocked') {
+    const hint = plan.task && plan.task.status === 'unresolved'
+      ? `; run: node cli.mjs recover --requestId ${plan.task.requestId}`
+      : '';
+    fail(`operation blocked: ${plan.reason}${hint}`);
+  }
+  if (plan.action === 'reused') {
+    return { output: plan.task.output, reused: true };
+  }
+  createTask(descriptor);
+  setTaskStatus(descriptor.requestId, 'running');
+  try {
+    const output = await execute();
+    setTaskStatus(descriptor.requestId, 'done', { output, reason: 'done' });
+    return { output, reused: false };
+  } catch (error) {
+    const status = error && error.transport ? 'unresolved' : 'failed';
+    setTaskStatus(descriptor.requestId, status, { reason: error && error.message ? error.message : String(error) });
+    throw error;
+  }
+}
+
+function reportReused(requestId, reused) {
+  if (reused) process.stderr.write(`reused: ${requestId}\n`);
+}
+
 function commandConnect(options) {
   const channel = channelName(options.channel);
   const fileKey = options.fileKey || null;
@@ -263,7 +293,7 @@ function commandConnect(options) {
 
   const binding = readBinding();
   const id = options.id || 'cli';
-  const socket = openSocket(channel, id);
+  const socket = openSocket(channel);
 
   socket.on('open', () => {
     socket.send(JSON.stringify({ type: 'figrig-id', id }));
@@ -313,7 +343,7 @@ function commandBind(positional) {
 async function commandRead(options) {
   const intent = options.intent;
   if (typeof intent !== 'string' || intent.length === 0) {
-    fail(`usage: node cli.mjs read --intent <${INTENTS.join('|')}> [--nodeId <id>]`);
+    fail(`usage: node cli.mjs read --intent <${INTENTS.join('|')}> [--nodeId <id>] [--requestId <uuid>]`);
   }
   if (!INTENTS.includes(intent)) {
     fail(`invalid intent: ${intent}; allowed: ${INTENTS.join(', ')}`);
@@ -324,24 +354,36 @@ async function commandRead(options) {
   const nodeId = resolveNodeId(options.nodeId) || bindingNodeId();
   if (!nodeId) fail('nodeId required: pass --nodeId or run bind first');
   const mode = format === 'jsx' ? 'overview' : 'full';
-  const result = await requestInspect(options, nodeId, mode);
-  const output = converter(result.node);
-  console.log(typeof output === 'string' ? output : JSON.stringify(output, null, 2));
+  const requestId = requestIdFrom(options);
+  const descriptor = { requestId, operation: 'read', nodeId, params: { intent, mode }, expect: [] };
+  const { output, reused } = await withIdempotency(descriptor, { mutation: false }, async () => {
+    const result = await requestInspect(options, nodeId, mode, requestId);
+    const converted = converter(result.node);
+    return { status: 'read', intent, format, text: typeof converted === 'string' ? converted : JSON.stringify(converted, null, 2) };
+  });
+  console.log(output.text);
+  reportReused(requestId, reused);
 }
 
 // 读取指定子树完整属性。输出走 JSON 白名单转换器。
 async function commandExpand(options) {
   const nodeId = resolveNodeId(options.nodeId) || bindingNodeId();
   if (!nodeId) fail('nodeId required: pass --nodeId or run bind first');
-  const result = await requestInspect(options, nodeId, 'full');
-  console.log(convertJson(result.node));
+  const requestId = requestIdFrom(options);
+  const descriptor = { requestId, operation: 'expand', nodeId, params: { mode: 'full' }, expect: [] };
+  const { output, reused } = await withIdempotency(descriptor, { mutation: false }, async () => {
+    const result = await requestInspect(options, nodeId, 'full', requestId);
+    return { status: 'expanded', nodeId, text: convertJson(result.node) };
+  });
+  console.log(output.text);
+  reportReused(requestId, reused);
 }
 
 // 写入节点：经 relay 发 write，对回包节点或删除回执执行断言核验。
 async function commandWrite(options) {
   const op = options.op;
   if (typeof op !== 'string' || op.length === 0) {
-    fail(`usage: node cli.mjs write --op <${WRITE_OPS.join('|')}> [--parentId <id>] [--nodeId <id>] [--params <json>] [--expect <assertion>]...`);
+    fail(`usage: node cli.mjs write --op <${WRITE_OPS.join('|')}> [--parentId <id>] [--nodeId <id>] [--params <json>] [--expect <assertion>]... [--requestId <uuid>]`);
   }
   if (!WRITE_OPS.includes(op)) {
     fail(`invalid op: ${op}; allowed: ${WRITE_OPS.join(', ')}`);
@@ -358,52 +400,152 @@ async function commandWrite(options) {
     }
   }
   const expects = normalizeList(options.expect);
-  const payload = {
-    type: 'write',
-    requestId: requestId(),
-    op,
-    parentId: resolveNodeId(options.parentId),
-    nodeId: resolveNodeId(options.nodeId),
-    params,
-  };
-  const result = await requestWrite(options, payload);
-  // 删除回执以自身为断言目标，其余以回包节点为断言目标。
-  const target = result.deleted !== undefined ? result : result.node;
-  const failures = [];
-  let passed = 0;
-  for (const assertion of expects) {
-    const outcome = evaluateAssertion(target, assertion);
-    if (outcome.ok) passed += 1;
-    else failures.push({ assertion: outcome.assertion, reason: outcome.reason });
-  }
-  if (failures.length > 0) {
-    console.log(JSON.stringify({ status: 'failed', assertions: passed, failures }));
-    process.exit(1);
-  }
-  console.log(JSON.stringify({ status: 'applied', assertions: passed }));
+  const parentId = resolveNodeId(options.parentId);
+  const nodeId = resolveNodeId(options.nodeId);
+  const requestId = requestIdFrom(options);
+  const targetNodeId = CREATE_SET.has(op) ? parentId : nodeId;
+  const descriptor = { requestId, operation: op, nodeId: targetNodeId, params, expect: expects };
+  const { output, reused } = await withIdempotency(descriptor, { mutation: true }, async () => {
+    const payload = { type: 'write', requestId, op, parentId, nodeId, params };
+    const result = await requestWrite(options, payload);
+    // 删除回执以自身为断言目标，其余以回包节点为断言目标。
+    const target = result.deleted !== undefined ? result : result.node;
+    const failures = [];
+    let passed = 0;
+    for (const assertion of expects) {
+      const outcome = evaluateAssertion(target, assertion);
+      if (outcome.ok) passed += 1;
+      else failures.push({ assertion: outcome.assertion, reason: outcome.reason });
+    }
+    const resultNodeId = result.deleted !== undefined ? result.nodeId : result.node.id;
+    if (failures.length > 0) {
+      const error = new Error('assertion failed');
+      error.output = { status: 'failed', op, nodeId: resultNodeId, assertions: passed, failures };
+      throw error;
+    }
+    return { status: 'applied', op, nodeId: resultNodeId, assertions: passed };
+  });
+  console.log(JSON.stringify({ ...output, reused }));
 }
 
 // 图片导出：经 preview 取 PNG 字节写入 .figrig-run/images，输出路径引用。
 async function commandReview(options) {
   const nodeId = resolveNodeId(options.nodeId) || bindingNodeId();
   if (!nodeId) fail('nodeId required: pass --nodeId or run bind first');
-  const result = await requestPreview(options, nodeId);
-  const bytes = Buffer.from(result.bytes);
-  mkdirSync(IMAGE_DIR, { recursive: true });
-  const normalized = nodeId.replace(/:/g, '_');
-  const path = join(IMAGE_DIR, `${normalized}-${Date.now()}.png`);
-  writeFileSync(path, bytes);
-  console.log(JSON.stringify({ status: 'exported', path }));
+  const requestId = requestIdFrom(options);
+  const descriptor = { requestId, operation: 'review', nodeId, params: { mode: 'png' }, expect: [] };
+  const { output, reused } = await withIdempotency(descriptor, { mutation: false }, async () => {
+    const result = await requestPreview(options, nodeId, requestId);
+    const bytes = Buffer.from(result.bytes);
+    mkdirSync(IMAGE_DIR, { recursive: true });
+    const normalized = nodeId.replace(/:/g, '_');
+    const path = join(IMAGE_DIR, `${normalized}-${Date.now()}.png`);
+    writeFileSync(path, bytes);
+    return { status: 'exported', nodeId, path };
+  });
+  console.log(JSON.stringify({ ...output, reused }));
+}
+
+// 故障恢复：对 unresolved 任务发起独立 inspect，按核验结果判定状态。不重放原操作。
+async function commandRecover(options) {
+  const requestId = typeof options.requestId === 'string' && options.requestId.length > 0 ? options.requestId : null;
+  const nodeId = resolveNodeId(options.nodeId);
+  if (!requestId && !nodeId) fail('usage: node cli.mjs recover (--requestId <uuid> | --nodeId <id>)');
+  const inspect = async (targetId) => {
+    try {
+      const result = await requestInspect(options, targetId, 'full', uuidv4());
+      return { found: true, node: result.node };
+    } catch (error) {
+      if (!error.transport && /node not found/.test(error.message)) return { found: false };
+      throw error;
+    }
+  };
+  const report = await resolveUnresolved({ requestId, nodeId }, { inspect });
+  console.log(JSON.stringify(report, null, 2));
+  if (report.pending > 0) process.exitCode = 1;
+}
+
+// 组件登记：读取指定节点 full 序列化，生成操作模板；--confirm 后写入注册表。
+async function commandComponentAdd(options) {
+  const name = typeof options.name === 'string' && options.name.length > 0 ? options.name : null;
+  if (!name) fail('usage: node cli.mjs component-add --name <name> [--nodeId <id>] [--source local|imported] [--confirm]');
+  const nodeId = resolveNodeId(options.nodeId) || bindingNodeId();
+  if (!nodeId) fail('nodeId required: pass --nodeId or run bind first');
+  const source = options.source === 'imported' ? 'imported' : 'local';
+  const result = await requestInspect(options, nodeId, 'full', uuidv4());
+  const template = buildTemplate(result.node);
+  if (options.confirm !== 'true') {
+    console.log(JSON.stringify({ status: 'confirm-required', name, nodeId, source, template }, null, 2));
+    return;
+  }
+  const record = addComponent({ name, nodeId, source, template });
+  console.log(JSON.stringify({
+    status: 'registered',
+    name: record.name,
+    nodeId: record.nodeId,
+    source: record.source,
+    steps: record.template.length,
+    path: registryPath(),
+  }, null, 2));
+}
+
+// 组件列表：输出注册表条目概要。
+function commandComponentList() {
+  const components = readComponents();
+  const summary = components.map((entry) => ({
+    name: entry.name,
+    nodeId: entry.nodeId,
+    source: entry.source,
+    steps: Array.isArray(entry.template) ? entry.template.length : 0,
+  }));
+  console.log(JSON.stringify({ count: summary.length, components: summary, path: registryPath() }, null, 2));
+}
+
+// 组件复用：按模板在新父节点下逐条执行并逐条断言。
+async function commandComponentUse(options) {
+  const name = typeof options.name === 'string' && options.name.length > 0 ? options.name : null;
+  if (!name) fail('usage: node cli.mjs component-use --name <name> --parentId <id> [--requestId <uuid>]');
+  const parentId = resolveNodeId(options.parentId) || bindingNodeId();
+  if (!parentId) fail('parentId required: pass --parentId or run bind first');
+  const component = getComponent(name);
+  if (!component) fail(`component not found: ${name}`);
+  const template = Array.isArray(component.template) ? component.template : [];
+  const requestId = requestIdFrom(options);
+  const descriptor = { requestId, operation: 'component-use', nodeId: parentId, params: { name, steps: template.length }, expect: [] };
+  const { output, reused } = await withIdempotency(descriptor, { mutation: true }, async () => {
+    const steps = await replayTemplate(template, parentId, ({ op, parentId: stepParent, nodeId, params }) => requestWrite(options, {
+      type: 'write',
+      requestId: uuidv4(),
+      op,
+      parentId: stepParent,
+      nodeId,
+      params,
+    }));
+    return { status: 'applied', component: name, parentId, steps };
+  });
+  console.log(JSON.stringify({ ...output, reused }));
 }
 
 function usage() {
   console.log('usage: node cli.mjs <command> [args]');
   console.log('  connect [--channel <name>] [--id <name>] [--fileKey <key>]');
   console.log('  bind <figma-url>');
-  console.log(`  read --intent <${INTENTS.join('|')}> [--nodeId <id>] [--channel <name>]`);
-  console.log('  expand [--nodeId <id>] [--channel <name>]');
-  console.log(`  write --op <${WRITE_OPS.join('|')}> [--parentId <id>] [--nodeId <id>] [--params <json>] [--expect <assertion>]...`);
-  console.log('  review --nodeId <id> [--channel <name>]');
+  console.log(`  read --intent <${INTENTS.join('|')}> [--nodeId <id>] [--requestId <uuid>] [--channel <name>]`);
+  console.log('  expand [--nodeId <id>] [--requestId <uuid>] [--channel <name>]');
+  console.log(`  write --op <${WRITE_OPS.join('|')}> [--parentId <id>] [--nodeId <id>] [--params <json>] [--expect <assertion>]... [--requestId <uuid>]`);
+  console.log('  review --nodeId <id> [--requestId <uuid>] [--channel <name>]');
+  console.log('  recover (--requestId <uuid> | --nodeId <id>) [--channel <name>]');
+  console.log('  component-add --name <name> [--nodeId <id>] [--source local|imported] [--confirm]');
+  console.log('  component-list');
+  console.log('  component-use --name <name> --parentId <id> [--requestId <uuid>]');
+}
+
+function handleCommandError(error) {
+  if (error && error.output) {
+    console.log(JSON.stringify(error.output));
+    process.exit(1);
+  }
+  fail(error && error.message ? error.message : String(error));
 }
 
 function main() {
@@ -423,19 +565,35 @@ function main() {
     return;
   }
   if (command === 'read') {
-    commandRead(options).catch((error) => fail(error.message));
+    commandRead(options).catch(handleCommandError);
     return;
   }
   if (command === 'expand') {
-    commandExpand(options).catch((error) => fail(error.message));
+    commandExpand(options).catch(handleCommandError);
     return;
   }
   if (command === 'write') {
-    commandWrite(options).catch((error) => fail(error.message));
+    commandWrite(options).catch(handleCommandError);
     return;
   }
   if (command === 'review') {
-    commandReview(options).catch((error) => fail(error.message));
+    commandReview(options).catch(handleCommandError);
+    return;
+  }
+  if (command === 'recover') {
+    commandRecover(options).catch(handleCommandError);
+    return;
+  }
+  if (command === 'component-add') {
+    commandComponentAdd(options).catch(handleCommandError);
+    return;
+  }
+  if (command === 'component-list') {
+    commandComponentList();
+    return;
+  }
+  if (command === 'component-use') {
+    commandComponentUse(options).catch(handleCommandError);
     return;
   }
   fail(`unknown command: ${command}`);
