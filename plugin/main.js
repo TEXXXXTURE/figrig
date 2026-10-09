@@ -151,6 +151,11 @@ async function handleInspect(message) {
   }
 }
 
+// 原型触发器枚举：首版仅 ON_CLICK。
+const PROTOTYPE_TRIGGERS = Object.freeze(['ON_CLICK']);
+// 原型动作枚举：navigate/overlay/scroll/back。
+const PROTOTYPE_ACTIONS = Object.freeze(['navigate', 'overlay', 'scroll', 'back']);
+
 const WRITE_OPS = Object.freeze([
   'create-frame',
   'create-rectangle',
@@ -394,6 +399,115 @@ async function handleWrite(message) {
   await handleModify(message, op, params);
 }
 
+// 动作名 -> Figma ReactionAction。非法动作返回 null，不推断。
+function buildPrototypeAction(link) {
+  switch (link.action) {
+    case 'navigate':
+      return { type: 'NODE', destinationId: link.to, navigation: 'NAVIGATE' };
+    case 'overlay':
+      return { type: 'OVERLAY', overlayId: link.to };
+    case 'scroll':
+      return { type: 'SCROLL_TO', destinationId: link.to };
+    case 'back':
+      return { type: 'BACK' };
+    default:
+      return null;
+  }
+}
+
+// reactions 序列化：仅保留 trigger 类型与 action 关键字段。
+function serializeReaction(reaction) {
+  if (reaction === null || typeof reaction !== 'object') return null;
+  const out = {
+    trigger: reaction.trigger && typeof reaction.trigger === 'object' ? { type: reaction.trigger.type } : null,
+    action: null,
+  };
+  const action = reaction.action;
+  if (action && typeof action === 'object') {
+    const entry = { type: action.type };
+    if (action.type === 'NODE') {
+      entry.destinationId = action.destinationId ?? null;
+      entry.navigation = action.navigation ?? null;
+    } else if (action.type === 'OVERLAY') {
+      entry.overlayId = action.overlayId ?? null;
+    } else if (action.type === 'SCROLL_TO') {
+      entry.destinationId = action.destinationId ?? null;
+    }
+    out.action = entry;
+  }
+  return out;
+}
+
+// 原型关系写入：links 逐条校验后，同一 from 节点整体替换 reactions。
+// 读回每个 from 节点的 reactions 随回包返回，供 CLI 断言核验。
+async function handlePrototype(message) {
+  const links = Array.isArray(message.links) ? message.links : null;
+  if (links === null || links.length === 0) {
+    postError(message, 'links required');
+    return;
+  }
+  const relations = [];
+  for (const link of links) {
+    const trigger = link && link.trigger;
+    if (typeof trigger !== 'string' || !PROTOTYPE_TRIGGERS.includes(trigger)) {
+      postError(message, `invalid trigger: ${String(trigger)}; allowed: ${PROTOTYPE_TRIGGERS.join(', ')}`);
+      return;
+    }
+    if (!link || typeof link.from !== 'string' || link.from.length === 0) {
+      postError(message, 'link.from required');
+      return;
+    }
+    const action = buildPrototypeAction(link);
+    if (action === null) {
+      postError(message, `invalid action: ${String(link.action)}; allowed: ${PROTOTYPE_ACTIONS.join(', ')}`);
+      return;
+    }
+    // 非 back 动作需要 to 且目标节点存在；back 无 to。
+    if (action.type !== 'BACK') {
+      if (typeof link.to !== 'string' || link.to.length === 0) {
+        postError(message, `link.to required for action ${link.action}`);
+        return;
+      }
+      const target = await figma.getNodeByIdAsync(link.to);
+      if (target === null) {
+        postError(message, `node not found: ${link.to}`);
+        return;
+      }
+    }
+    const source = await figma.getNodeByIdAsync(link.from);
+    if (source === null) {
+      postError(message, `node not found: ${link.from}`);
+      return;
+    }
+    relations.push({
+      from: link.from,
+      reaction: { trigger: { type: trigger }, action },
+    });
+  }
+  // 整体替换：按 from 分组，每组写入全部关系。
+  const bySource = new Map();
+  for (const relation of relations) {
+    const list = bySource.get(relation.from) ?? [];
+    list.push(relation.reaction);
+    bySource.set(relation.from, list);
+  }
+  const readback = [];
+  for (const [from, reactions] of bySource) {
+    const source = await figma.getNodeByIdAsync(from);
+    source.reactions = reactions;
+    const actual = Array.isArray(source.reactions) ? source.reactions.map(serializeReaction) : [];
+    readback.push({ from, actual });
+  }
+  post({
+    type: 'prototype-result',
+    requestId: message.requestId ?? null,
+    fileKey: figma.fileKey ?? null,
+    count: relations.length,
+    nodes: bySource.size,
+    readback,
+  });
+}
+
 async function handlePreview(message) {
   const nodeId = message.nodeId;
   if (typeof nodeId !== 'string' || nodeId.length === 0) {
@@ -430,6 +544,9 @@ async function handle(message) {
       return;
     case 'preview':
       await handlePreview(message);
+      return;
+    case 'prototype':
+      await handlePrototype(message);
       return;
     case 'ping':
       post({ type: 'pong', requestId: message.requestId ?? null, fileKey: figma.fileKey ?? null });

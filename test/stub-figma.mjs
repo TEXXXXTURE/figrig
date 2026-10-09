@@ -27,6 +27,7 @@ export function createStubFigma() {
       this.height = 100;
       this.parent = null;
       this._children = [];
+      this.reactions = [];
     }
 
     get children() {

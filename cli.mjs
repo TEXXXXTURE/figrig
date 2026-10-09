@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // cli：命令行入口。命令 connect（作为 channel 成员挂起）、bind（解析 Figma 链接并写入绑定）、
 // read（按意图路由格式并读取节点）、expand（读取指定节点完整属性）、write（写入并断言）、
-// review（导出 PNG）、recover（故障恢复）、component-add / component-list / component-use（组件注册表）。
+// review（导出 PNG）、recover（故障恢复）、component-add / component-list / component-use（组件注册表）、
+// prototype（原型关系写入并读回断言）。
 // 经 relay 的请求携带 UUID v4 格式 requestId，并记入任务记录以支持幂等与故障恢复。
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -18,6 +19,7 @@ import { WRITE_OPS, CREATE_SET } from './ops.mjs';
 import { createTask, planOperation, setTaskStatus, uuidv4 } from './task-store.mjs';
 import { resolveUnresolved } from './recover.mjs';
 import { addComponent, buildTemplate, getComponent, readComponents, registryPath, replayTemplate } from './registry.mjs';
+import { parseLinks, verifyReadback } from './prototype.mjs';
 
 const RELAY_HOST = '127.0.0.1';
 const RELAY_PORT = Number(process.env.FIGRIG_RELAY_PORT) || 3055;
@@ -501,6 +503,42 @@ function commandComponentList() {
   console.log(JSON.stringify({ count: summary.length, components: summary, path: registryPath() }, null, 2));
 }
 
+// 原型关系写入：--file 或 --json 给定 links；经 relay 发 prototype，读回 reactions 断言核验。
+// 差异式语义：links 仅列需设置的关系；同一 from 节点整体替换 reactions，不做增量合并。
+async function commandPrototype(options) {
+  let text = null;
+  if (typeof options.file === 'string' && options.file.length > 0) {
+    try {
+      text = readFileSync(resolve(options.file), 'utf8');
+    } catch {
+      fail(`cannot read file: ${options.file}`);
+    }
+  } else if (typeof options.json === 'string' && options.json.length > 0) {
+    text = options.json;
+  } else {
+    fail('usage: node cli.mjs prototype (--file <json> | --json <json>) [--requestId <uuid>] [--channel <name>]');
+  }
+  let links;
+  try {
+    links = parseLinks(text);
+  } catch (error) {
+    fail(error.message);
+  }
+  const requestId = requestIdFrom(options);
+  const descriptor = { requestId, operation: 'prototype', nodeId: null, params: { links }, expect: [] };
+  const { output, reused } = await withIdempotency(descriptor, { mutation: true }, async () => {
+    const result = await requestRelay(options, { type: 'prototype', requestId, links }, 'prototype-result', 'prototype');
+    const failures = verifyReadback(links, result.readback);
+    if (failures.length > 0) {
+      const error = new Error('prototype assertion failed');
+      error.output = { status: 'failed', links: links.length, failures };
+      throw error;
+    }
+    return { status: 'applied', links: links.length, nodes: result.nodes ?? 0 };
+  });
+  console.log(JSON.stringify({ ...output, reused }));
+}
+
 // 组件复用：按模板在新父节点下逐条执行并逐条断言。
 async function commandComponentUse(options) {
   const name = typeof options.name === 'string' && options.name.length > 0 ? options.name : null;
@@ -538,6 +576,7 @@ function usage() {
   console.log('  component-add --name <name> [--nodeId <id>] [--source local|imported] [--confirm]');
   console.log('  component-list');
   console.log('  component-use --name <name> --parentId <id> [--requestId <uuid>]');
+  console.log('  prototype (--file <json> | --json <json>) [--requestId <uuid>] [--channel <name>]');
 }
 
 function handleCommandError(error) {
@@ -594,6 +633,10 @@ function main() {
   }
   if (command === 'component-use') {
     commandComponentUse(options).catch(handleCommandError);
+    return;
+  }
+  if (command === 'prototype') {
+    commandPrototype(options).catch(handleCommandError);
     return;
   }
   fail(`unknown command: ${command}`);

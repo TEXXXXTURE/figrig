@@ -1,9 +1,12 @@
 {
   "name": "figrig",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "本地链路：AI Agent 经 CLI 读写 Figma 文件、制作可交互原型。",
   "type": "module",
   "license": "Apache-2.0",
+  "bin": {
+    "figrig": "./cli.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/TEXXXXTURE/figrig.git"
@@ -14,7 +17,7 @@
   "scripts": {
     "start": "node relay.mjs",
     "relay": "node relay.mjs",
-    "check": "node --check relay.mjs && node --check cli.mjs && node --check assert.mjs && node --check ops.mjs && node --check task-store.mjs && node --check recover.mjs && node --check registry.mjs && node --check plugin/main.js && node --check formats/index.mjs && node --check formats/jsx.mjs && node --check formats/json.mjs && node --check formats/svg.mjs && node --check formats/png.mjs && node --check test/stub-figma.mjs && node --check test/verify.mjs && node --check test/e2e.mjs",
+    "check": "node --check relay.mjs && node --check cli.mjs && node --check assert.mjs && node --check ops.mjs && node --check prototype.mjs && node --check task-store.mjs && node --check recover.mjs && node --check registry.mjs && node --check plugin/main.js && node --check formats/index.mjs && node --check formats/jsx.mjs && node --check formats/json.mjs && node --check formats/svg.mjs && node --check formats/png.mjs && node --check test/stub-figma.mjs && node --check test/verify.mjs && node --check test/e2e.mjs",
     "verify": "node test/verify.mjs",
     "e2e": "node test/e2e.mjs"
   },

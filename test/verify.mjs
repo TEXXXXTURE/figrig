@@ -17,6 +17,7 @@ import { createStubFigma, loadPlugin as loadStubPlugin } from './stub-figma.mjs'
 import { uuidv4, planOperation, createTask, setTaskStatus } from '../task-store.mjs';
 import { resolveUnresolved } from '../recover.mjs';
 import { buildTemplate, addComponent, getComponent, readComponents, writeComponents, replayTemplate } from '../registry.mjs';
+import { parseLinks, buildAction, matchReaction, verifyReadback } from '../prototype.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -34,6 +35,11 @@ function flatten(node, list = []) {
 
 function solid(hex, rgba, color) {
   return { type: 'SOLID', visible: true, opacity: 1, hex, rgba, color };
+}
+
+// 跨 vm 域深比较辅助：插件回包对象来自 vm 领域，序列化还原为宿主域纯对象后比较。
+function plainCopy(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 // 桩树：Frame×3、Text×2、Rectangle×1，含填充与 Auto Layout 属性。
@@ -677,6 +683,158 @@ async function main() {
   assert.equal(created.children[0].name, 'Title');
   assert.equal(created.children[0].characters, 'Hi');
   console.log(`replayTemplate ${replaySteps.length} 步 -> Card(name=${created.name}, layout=${created.layoutMode}, fill=${created.fills[0].type}, children=${created.children.length}) ok`);
+
+  section('22. prototype.mjs：四种动作结构与字段断言');
+  const navLink = parseLinks(JSON.stringify({ links: [{ from: '1-1', trigger: 'click', action: 'navigate', to: '1-2' }] }))[0];
+  assert.deepEqual(navLink, { from: '1:1', trigger: 'ON_CLICK', action: 'navigate', to: '1:2' });
+  assert.deepEqual(buildAction(navLink), { type: 'NODE', destinationId: '1:2', navigation: 'NAVIGATE' });
+  console.log(`navigate -> ${JSON.stringify(buildAction(navLink))}`);
+
+  const overlayLink = parseLinks(JSON.stringify({ links: [{ from: '1:1', trigger: 'click', action: 'overlay', to: '1:3' }] }))[0];
+  assert.deepEqual(buildAction(overlayLink), { type: 'OVERLAY', overlayId: '1:3' });
+  console.log(`overlay -> ${JSON.stringify(buildAction(overlayLink))}`);
+
+  const scrollLink = parseLinks(JSON.stringify({ links: [{ from: '1:1', trigger: 'click', action: 'scroll', to: '1:4' }] }))[0];
+  assert.deepEqual(buildAction(scrollLink), { type: 'SCROLL_TO', destinationId: '1:4' });
+  console.log(`scroll -> ${JSON.stringify(buildAction(scrollLink))}`);
+
+  const backLink = parseLinks(JSON.stringify({ links: [{ from: '1:1', trigger: 'click', action: 'back' }] }))[0];
+  assert.deepEqual(backLink, { from: '1:1', trigger: 'ON_CLICK', action: 'back', to: null });
+  assert.deepEqual(buildAction(backLink), { type: 'BACK' });
+  assert.equal(matchReaction(backLink, { trigger: { type: 'ON_CLICK' }, action: { type: 'BACK' } }), true);
+  console.log(`back -> ${JSON.stringify(buildAction(backLink))}`);
+  console.log('assert: 四种动作 action 结构（NODE/NAVIGATE、OVERLAY/overlayId、SCROLL_TO/destinationId、BACK）-> ok');
+
+  section('23. prototype.mjs：非法枚举与缺 to 报错，不推断');
+  const badSpecs = [
+    [{ links: [{ from: '1:1', trigger: 'hover', action: 'navigate', to: '1:2' }] }, /invalid trigger/],
+    [{ links: [{ from: '1:1', trigger: 'click', action: 'nuke', to: '1:2' }] }, /invalid action/],
+    [{ links: [{ from: '1:1', trigger: 'click', action: 'navigate' }] }, /to required/],
+    [{ links: [] }, /must not be empty/],
+    [{}, /must be \{"links":/],
+    [{ links: [{ from: '', trigger: 'click', action: 'back' }] }, /from required/],
+    [{ links: [{ from: 'x:y', trigger: 'click', action: 'back' }] }, /invalid from node id/],
+  ];
+  for (const [spec, pattern] of badSpecs) {
+    assert.throws(() => parseLinks(JSON.stringify(spec)), pattern);
+    console.log(`parseLinks(非法) -> throws: ${pattern}`);
+  }
+
+  section('24. prototype.mjs：读回断言命中与失败检出');
+  const links2 = parseLinks(JSON.stringify({
+    links: [
+      { from: '1:1', trigger: 'click', action: 'navigate', to: '1:2' },
+      { from: '1:2', trigger: 'click', action: 'overlay', to: '1:3' },
+    ],
+  }));
+  const goodReadback = [
+    { from: '1:1', actual: [{ trigger: { type: 'ON_CLICK' }, action: { type: 'NODE', destinationId: '1:2', navigation: 'NAVIGATE' } }] },
+    { from: '1:2', actual: [{ trigger: { type: 'ON_CLICK' }, action: { type: 'OVERLAY', overlayId: '1:3' } }] },
+  ];
+  assert.deepEqual(verifyReadback(links2, goodReadback), []);
+  console.log('verifyReadback(全部命中) -> []');
+
+  const badReadback = [
+    { from: '1:1', actual: [{ trigger: { type: 'ON_HOVER' }, action: { type: 'NODE', destinationId: '9:9', navigation: 'NAVIGATE' } }] },
+    { from: '1:2', actual: [] },
+  ];
+  const failures = verifyReadback(links2, badReadback);
+  assert.ok(failures.length >= 2, '断言失败须被检出');
+  const noReadback = verifyReadback(links2, []);
+  assert.ok(noReadback.length >= 2, '缺读回须被检出');
+  const extraCount = verifyReadback(links2, [
+    { from: '1:1', actual: [
+      { trigger: { type: 'ON_CLICK' }, action: { type: 'NODE', destinationId: '1:2', navigation: 'NAVIGATE' } },
+      { trigger: { type: 'ON_CLICK' }, action: { type: 'BACK' } },
+    ] },
+    { from: '1:2', actual: [{ trigger: { type: 'ON_CLICK' }, action: { type: 'OVERLAY', overlayId: '1:3' } }] },
+  ]);
+  assert.ok(extraCount.some((item) => /count mismatch/.test(item.reason)), '多余关系须按整体替换语义检出');
+  console.log(`verifyReadback(不符) -> ${failures.length} 项失败：${failures.map((item) => item.reason).join('; ')}`);
+  console.log(`verifyReadback(缺读回) -> ${noReadback.length} 项失败`);
+  console.log(`verifyReadback(条数不符) -> ${extraCount.length} 项失败（整体替换语义）`);
+
+  section('25. 插件 prototype：四种动作写入与读回（桩 Figma）');
+  const harness5 = createStubFigma();
+  const screenA = harness5.add(new harness5.StubNode('FRAME', 'ScreenA'));
+  const screenB = harness5.add(new harness5.StubNode('FRAME', 'ScreenB'));
+  const overlayPanel = harness5.add(new harness5.StubNode('FRAME', 'Overlay'));
+  const container = harness5.add(new harness5.StubNode('FRAME', 'Container'));
+  const btnNav = harness5.add(new harness5.StubNode('FRAME', 'BtnNav'));
+  const btnOverlay = harness5.add(new harness5.StubNode('FRAME', 'BtnOverlay'));
+  const btnScroll = harness5.add(new harness5.StubNode('FRAME', 'BtnScroll'));
+  const btnBack = harness5.add(new harness5.StubNode('FRAME', 'BtnBack'));
+  for (const child of [btnNav, btnOverlay, btnScroll, btnBack]) screenA.appendChild(child);
+  const plugin5 = loadStubPlugin(harness5.figma);
+
+  const proto = await plugin5.send({
+    type: 'prototype', requestId: 'pt1',
+    links: [
+      { from: btnNav.id, trigger: 'ON_CLICK', action: 'navigate', to: screenB.id },
+      { from: btnOverlay.id, trigger: 'ON_CLICK', action: 'overlay', to: overlayPanel.id },
+      { from: btnScroll.id, trigger: 'ON_CLICK', action: 'scroll', to: container.id },
+      { from: btnBack.id, trigger: 'ON_CLICK', action: 'back' },
+    ],
+  });
+  assert.equal(proto.type, 'prototype-result');
+  assert.equal(proto.count, 4);
+  assert.equal(proto.nodes, 4);
+  const readbackMap = new Map(proto.readback.map((item) => [item.from, item.actual]));
+  assert.deepEqual(plainCopy(readbackMap.get(btnNav.id)), [{ trigger: { type: 'ON_CLICK' }, action: { type: 'NODE', destinationId: screenB.id, navigation: 'NAVIGATE' } }]);
+  assert.deepEqual(plainCopy(readbackMap.get(btnOverlay.id)), [{ trigger: { type: 'ON_CLICK' }, action: { type: 'OVERLAY', overlayId: overlayPanel.id } }]);
+  assert.deepEqual(plainCopy(readbackMap.get(btnScroll.id)), [{ trigger: { type: 'ON_CLICK' }, action: { type: 'SCROLL_TO', destinationId: container.id } }]);
+  assert.deepEqual(plainCopy(readbackMap.get(btnBack.id)), [{ trigger: { type: 'ON_CLICK' }, action: { type: 'BACK' } }]);
+  assert.equal(harness5.registry.get(btnNav.id).reactions.length, 1);
+  console.log('四种动作 reactions 写入与读回（trigger/action/destinationId/overlayId）-> ok');
+
+  const replace = await plugin5.send({
+    type: 'prototype', requestId: 'pt2',
+    links: [{ from: btnNav.id, trigger: 'ON_CLICK', action: 'back' }],
+  });
+  assert.equal(replace.count, 1);
+  const replaced = replace.readback.find((item) => item.from === btnNav.id);
+  assert.deepEqual(plainCopy(replaced.actual), [{ trigger: { type: 'ON_CLICK' }, action: { type: 'BACK' } }]);
+  assert.equal(harness5.registry.get(btnNav.id).reactions.length, 1, '整体替换：旧关系清空');
+  console.log('同节点重复设置 -> 整体替换（旧关系清空，条数=本次输入）ok');
+
+  const multi = await plugin5.send({
+    type: 'prototype', requestId: 'pt3',
+    links: [
+      { from: btnBack.id, trigger: 'ON_CLICK', action: 'back' },
+      { from: btnBack.id, trigger: 'ON_CLICK', action: 'navigate', to: screenA.id },
+    ],
+  });
+  assert.equal(multi.count, 2);
+  const multiActual = multi.readback.find((item) => item.from === btnBack.id).actual;
+  assert.equal(multiActual.length, 2, '同节点多关系并存');
+  console.log('同节点两条关系 -> 并存且读回条数=2 ok');
+
+  const protoErrors = [
+    [{ links: [{ from: btnNav.id, trigger: 'ON_HOVER', action: 'navigate', to: screenB.id }] }, /invalid trigger/],
+    [{ links: [{ from: btnNav.id, trigger: 'ON_CLICK', action: 'nuke', to: screenB.id }] }, /invalid action/],
+    [{ links: [{ from: btnNav.id, trigger: 'ON_CLICK', action: 'navigate' }] }, /to required/],
+    [{ links: [{ from: btnNav.id, trigger: 'ON_CLICK', action: 'navigate', to: '9:9' }] }, /node not found: 9:9/],
+    [{ links: [{ from: '9:9', trigger: 'ON_CLICK', action: 'back' }] }, /node not found: 9:9/],
+    [{ links: [] }, /links required/],
+  ];
+  for (const [fields, pattern] of protoErrors) {
+    const outcome = await plugin5.send({ type: 'prototype', requestId: 'pt-err', ...fields });
+    assert.equal(outcome.type, 'error');
+    assert.match(outcome.message, pattern);
+    console.log(`prototype -> error: ${outcome.message}`);
+  }
+
+  const btnX = harness5.add(new harness5.StubNode('FRAME', 'BtnX'));
+  const partial = await plugin5.send({
+    type: 'prototype', requestId: 'pt-atomic',
+    links: [
+      { from: btnX.id, trigger: 'ON_CLICK', action: 'back' },
+      { from: btnNav.id, trigger: 'ON_CLICK', action: 'nuke' },
+    ],
+  });
+  assert.equal(partial.type, 'error');
+  assert.equal(harness5.registry.get(btnX.id).reactions.length, 0, '校验失败不产生部分写入');
+  console.log('多链接含非法项 -> error 且不产生部分写入 ok');
 
   console.log('\nALL CHECKS PASSED');
 }

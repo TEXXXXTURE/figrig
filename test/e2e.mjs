@@ -2,7 +2,7 @@
 // 桩节点驱动；真机 Figma 插件行为属外部验证项（visual: not-run）。
 
 import { execFile, spawn } from 'node:child_process';
-import { readFileSync, rmSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -179,6 +179,53 @@ async function main() {
   assert.equal(clone.paddingLeft, 8);
   assert.ok(clone.children.some((child) => child.name === 'Label'), '复放的 Label 存在');
   console.log(used.stdout.trim());
+
+  console.log('===== e2e 7. prototype --file 三屏关系 =====');
+  const screenA = harness.add(new harness.StubNode('FRAME', 'ScreenA'));
+  const screenB = harness.add(new harness.StubNode('FRAME', 'ScreenB'));
+  const screenC = harness.add(new harness.StubNode('FRAME', 'ScreenC'));
+  const btnAB = harness.add(new harness.StubNode('FRAME', 'BtnAB'));
+  const btnBC = harness.add(new harness.StubNode('FRAME', 'BtnBC'));
+  const btnBack = harness.add(new harness.StubNode('FRAME', 'BtnBack'));
+  screenA.appendChild(btnAB);
+  screenB.appendChild(btnBC);
+  screenC.appendChild(btnBack);
+
+  mkdirSync(resolve(ROOT, '.figrig-run'), { recursive: true });
+  const protoPath = resolve(ROOT, '.figrig-run', 'proto-e2e.json');
+  writeFileSync(protoPath, `${JSON.stringify({
+    links: [
+      { from: btnAB.id, trigger: 'click', action: 'navigate', to: screenB.id },
+      { from: btnBC.id, trigger: 'click', action: 'navigate', to: screenC.id },
+      { from: btnBack.id, trigger: 'click', action: 'back' },
+    ],
+  }, null, 2)}\n`, 'utf8');
+
+  const pReq = randomUUID();
+  const protoRun = await runCli(['prototype', '--channel', CHANNEL, '--file', protoPath, '--requestId', pReq]);
+  const protoOut = JSON.parse(protoRun.stdout.trim());
+  assert.equal(protoOut.status, 'applied');
+  assert.equal(protoOut.reused, false);
+  assert.equal(protoOut.links, 3);
+  assert.equal(protoOut.nodes, 3);
+  console.log(protoRun.stdout.trim());
+
+  const navBtn = harness.registry.get(btnAB.id);
+  assert.equal(navBtn.reactions.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(navBtn.reactions[0])), {
+    trigger: { type: 'ON_CLICK' },
+    action: { type: 'NODE', destinationId: screenB.id, navigation: 'NAVIGATE' },
+  });
+  const backBtn = harness.registry.get(btnBack.id);
+  assert.deepEqual(JSON.parse(JSON.stringify(backBtn.reactions[0])).action, { type: 'BACK' });
+  console.log('assert: 三个 from 节点 reactions 写入，navigate/back 字段与读回断言一致');
+
+  console.log('===== e2e 8. prototype 同 requestId 重投 -> reused =====');
+  const protoReplay = await runCli(['prototype', '--channel', CHANNEL, '--file', protoPath, '--requestId', pReq]);
+  const protoReplayOut = JSON.parse(protoReplay.stdout.trim());
+  assert.equal(protoReplayOut.reused, true);
+  assert.equal(harness.registry.get(btnAB.id).reactions.length, 1, '重投未二次执行');
+  console.log(protoReplay.stdout.trim());
 
   await new Promise((settle) => {
     socket.once('close', settle);
